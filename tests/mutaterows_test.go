@@ -548,3 +548,131 @@ func TestMutateRows_Retry_WithRetryInfo(t *testing.T) {
 
 	assert.True(t, retryReqTs-firstReqTs >= 2)
 }
+
+// TestMutateRows_NoRetry_MissingResponseEntry tests that client detects omitted MutateRows response entries on an OK stream.
+func TestMutateRows_NoRetry_MissingResponseEntry(t *testing.T) {
+	// 0. Common variables
+	const numRows int = 3
+	const numRPCs int = 1
+	const tableID string = "table"
+
+	// 1. Instantiate the mock server
+	recorder := make(chan *mutateRowsReqRecord, numRPCs+1)
+	action := &mutateRowsAction{
+		data:        buildEntryData([]int{0, 2}, nil, 0),
+		endOfStream: true,
+	}
+	server := initMockServer(t)
+	server.MutateRowsFn = mockMutateRowsFnSimple(recorder, action)
+
+	// 2. Build the request to test proxy
+	req := testproxypb.MutateRowsRequest{
+		ClientId: t.Name(),
+		Request:  dummyMutateRowsRequest(tableID, numRows),
+	}
+
+	// 3. Perform the operation via test proxy
+	res := doMutateRowsOp(t, server, &req, nil)
+
+	// 4a. Check the number of requests in the recorder (no retry)
+	assert.Equal(t, numRPCs, len(recorder))
+
+	// 4b. Check that top-level status is non-OK
+	assert.NotEqual(t, int32(codes.OK), res.GetStatus().GetCode())
+
+	// 4c. Check that entry 1 is reported as failed in res.GetEntries()
+	var foundEntry1Failure bool
+	for _, entry := range res.GetEntries() {
+		if entry.GetIndex() == 1 && entry.GetStatus().GetCode() != int32(codes.OK) {
+			foundEntry1Failure = true
+		}
+	}
+	assert.True(t, foundEntry1Failure, "entry 1 should be reported as failed in res.GetEntries()")
+}
+
+// TestMutateRows_NoRetry_ErrorNotificationParity tests that entry-level errors result in a non-OK top-level status.
+func TestMutateRows_NoRetry_ErrorNotificationParity(t *testing.T) {
+	// 0. Common variables
+	const numRows int = 2
+	const numRPCs int = 1
+	const tableID string = "table"
+
+	// 1. Instantiate the mock server
+	recorder := make(chan *mutateRowsReqRecord, numRPCs+1)
+	action := &mutateRowsAction{
+		data:        buildEntryData([]int{0}, []int{1}, codes.PermissionDenied),
+		endOfStream: true,
+	}
+	server := initMockServer(t)
+	server.MutateRowsFn = mockMutateRowsFnSimple(recorder, action)
+
+	// 2. Build the request to test proxy
+	req := testproxypb.MutateRowsRequest{
+		ClientId: t.Name(),
+		Request:  dummyMutateRowsRequest(tableID, numRows),
+	}
+
+	// 3. Perform the operation via test proxy
+	res := doMutateRowsOp(t, server, &req, nil)
+
+	// 4a. Check the number of requests in the recorder
+	assert.Equal(t, numRPCs, len(recorder))
+
+	// 4b. Check that top-level status is non-OK (error notification parity)
+	assert.NotEqual(t, int32(codes.OK), res.GetStatus().GetCode())
+}
+
+// TestMutateRows_Retry_MidStreamErrorPreservesConfirmedEntries tests that confirmed entries are not retried when a stream fails mid-flight.
+func TestMutateRows_Retry_MidStreamErrorPreservesConfirmedEntries(t *testing.T) {
+	// 0. Common variables
+	const numRows int = 2
+	const numRPCs int = 2
+	const tableID string = "table"
+	clientReq := dummyMutateRowsRequest(tableID, numRows)
+
+	// 1. Instantiate the mock server
+	recorder := make(chan *mutateRowsReqRecord, numRPCs+1)
+	actions := []*mutateRowsAction{
+		&mutateRowsAction{
+			data: buildEntryData([]int{0}, nil, 0),
+		},
+		&mutateRowsAction{
+			rpcError: codes.Unavailable,
+		},
+		&mutateRowsAction{
+			data:        buildEntryData([]int{0}, nil, 0),
+			endOfStream: true,
+		},
+	}
+	server := initMockServer(t)
+	server.MutateRowsFn = mockMutateRowsFn(recorder, actions)
+
+	// 2. Build the request to test proxy
+	req := testproxypb.MutateRowsRequest{
+		ClientId: t.Name(),
+		Request:  clientReq,
+	}
+
+	// 3. Perform the operation via test proxy
+	res := doMutateRowsOp(t, server, &req, nil)
+
+	// 4a. Check that overall operation succeeded
+	checkResultOkStatus(t, res)
+
+	// 4b. Check the number of requests in the recorder
+	assert.Equal(t, numRPCs, len(recorder))
+
+	// 4c. Check the recorded requests
+	firstReq := <-recorder
+	retryReq := <-recorder
+
+	if diff := cmp.Diff(clientReq, firstReq.req, protocmp.Transform()); diff != "" {
+		t.Errorf("diff found (-want +got):\n%s", diff)
+	}
+
+	expectedRetry := dummyMutateRowsRequestCore(tableID, []string{"row-1"})
+	if diff := cmp.Diff(expectedRetry, retryReq.req, protocmp.Transform()); diff != "" {
+		t.Errorf("diff found (-want +got):\n%s", diff)
+	}
+}
+
